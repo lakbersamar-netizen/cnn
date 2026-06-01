@@ -54,39 +54,48 @@ def selectionner_visage_principal(faces):
     return tuple(faces_sorted[0])
 
 
-def evaluer_stabilite_signal(signal_buffer, bpm_history_recent):
+def evaluer_qualite_signal(signal_buffer, bpm_history_recent):
     """
-    Évalue si le signal rPPG est stable.
-    Retourne (is_stable: bool)
+    Évalue la QUALITÉ du signal rPPG (mesure).
+    Retourne : "STABLE" ou "INSTABLE"
+    
+    INSTABLE si :
+    - Variance du buffer vert trop élevée (mouvements)
+    - Écart-type du BPM récent trop élevé (sauts chaotiques)
     """
     # 1. Vérifier la variance du signal
     if len(signal_buffer) > 10:
         signal_array = np.array(signal_buffer)
         signal_std = np.std(signal_array)
         if signal_std > SIGNAL_VARIANCE_THRESHOLD:
-            return False
+            return "INSTABLE"
     
-    # 2. Vérifier les sauts de BPM
+    # 2. Vérifier les sauts de BPM (indicateur de chaos)
     if len(bpm_history_recent) > 2:
         bpm_array = np.array(bpm_history_recent)
         bpm_std = np.std(bpm_array)
         if bpm_std > BPM_JUMP_THRESHOLD:
-            return False
+            return "INSTABLE"
     
-    return True
+    return "STABLE"
 
 
-def determiner_status(bpm_final, is_signal_stable):
+def evaluer_diagnostic_personne(bpm_final, qualite_signal):
     """
-    Logique finale de statut :
-    - Si signal INSTABLE → INSTABLE
-    - Si BPM NORMAL (50-100) → STABLE
-    - Si BPM > 100 → TACHYCARDIE
-    - Si BPM < 50 → FATIGUE
-    """
-    if not is_signal_stable:
-        return "INSTABLE", (0, 165, 255)  # Orange
+    Évalue le DIAGNOSTIC de la PERSONNE (état clinique).
+    Retourne : (diagnostic, couleur_rgb)
     
+    Logique :
+    - Si signal INSTABLE → "INDÉTERMINÉE (SIGNAL BRUITÉ)"
+    - Si signal STABLE :
+        - BPM < 50 → "FATIGUE"
+        - BPM 50-100 → "STABLE"
+        - BPM > 100 → "TACHYCARDIE"
+    """
+    if qualite_signal == "INSTABLE":
+        return "INDETERMINEE (SIGNAL BRUITE)", (0, 165, 255)  # Orange
+    
+    # Signal STABLE → on peut interpréter le BPM
     if bpm_final < 50:
         return "FATIGUE", (255, 255, 0)  # Cyan/Jaune
     elif bpm_final > 100:
@@ -95,7 +104,16 @@ def determiner_status(bpm_final, is_signal_stable):
         return "STABLE", (0, 255, 0)  # Vert
 
 
-def dessiner_les_graphes(frame, signal_ecg, bpm_history, bpm_final, status_actuel, status_color):
+def obtenir_couleur_signal(qualite_signal):
+    """Couleur spécifique pour l'affichage du statut SIGNAL"""
+    if qualite_signal == "INSTABLE":
+        return (0, 165, 255)  # Orange
+    else:
+        return (0, 255, 255)  # Cyan clair
+
+
+def dessiner_les_graphes(frame, signal_ecg, bpm_history, bpm_final, 
+                         qualite_signal, diagnostic_personne, couleur_diagnostic):
     """Dessine les graphes (signal ECG + historique BPM) sur la frame"""
     try:
         h, w, c = frame.shape
@@ -122,8 +140,10 @@ def dessiner_les_graphes(frame, signal_ecg, bpm_history, bpm_final, status_actue
         cv2.line(plot_area, (half_w, 10), (half_w, 140), (55, 55, 55), 1)
 
         # --- Graphe 2 : Historique BPM ---
-        cv2.putText(plot_area, f"2. Historique BPM (CNN): {int(bpm_final)} bpm | {status_actuel}", 
-                    (half_w + 10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, status_color, 1)
+        cv2.putText(plot_area, f"2. Historique BPM (CNN): {int(bpm_final)} bpm", 
+                    (half_w + 10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, couleur_diagnostic, 1)
+        cv2.putText(plot_area, f"   {diagnostic_personne}", 
+                    (half_w + 10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.3, couleur_diagnostic, 1)
         
         if len(bpm_history) > 2:
             bpm_min, bpm_max = 40.0, 140.0
@@ -138,7 +158,7 @@ def dessiner_les_graphes(frame, signal_ecg, bpm_history, bpm_final, status_actue
                 y2 = int(130 - ((val2 - bpm_min) / (bpm_max - bpm_min) * 80))
                 
                 if x2 < w:
-                    cv2.line(plot_area, (x1, y1), (x2, y2), status_color, 2)
+                    cv2.line(plot_area, (x1, y1), (x2, y2), couleur_diagnostic, 2)
                     
         return np.vstack((frame, plot_area))
     except Exception as e:
@@ -179,8 +199,9 @@ def generer_flux_batch():
         bpm_cnn_list = []
         bpm_peak_list = []
         
-        # === TRACKING DE L'INSTABILITÉ ===
-        frame_status_list = []
+        # === TRACKING SÉPARÉ SIGNAL et DIAGNOSTIC ===
+        frame_signal_quality_list = []  # Liste des qualités signal (STABLE/INSTABLE)
+        frame_diagnostic_list = []       # Liste des diagnostics personne (STABLE/TACHYCARDIE/FATIGUE/INDETERMINEE)
         total_frames = 0
 
         print(f"\n[▶] Traitement vidéo {index}/{len(liste_videos)} : {nom_video}")
@@ -200,8 +221,10 @@ def generer_flux_batch():
             bpm_final = 0
             bpm_classique = 0
             signal_a_dessiner = np.zeros(BUFFER_SIZE)
-            frame_status = "INITIALISATION"
-            status_color = (0, 255, 255)
+            qualite_signal = "INITIALISATION"
+            diagnostic_personne = "INITIALISATION"
+            couleur_signal = (0, 255, 255)
+            couleur_diagnostic = (0, 255, 255)
             
             if main_face is not None:
                 (x, y, w, h) = main_face
@@ -239,33 +262,45 @@ def generer_flux_batch():
                             cnn_bpm_history.append(bpm_cnn)
                             bpm_recent_window.append(bpm_cnn)
                         
-                        # === ÉVALUER LA STABILITÉ DE CETTE FRAME ===
-                        is_signal_stable = evaluer_stabilite_signal(
+                        # === ÉVALUER LA QUALITÉ DU SIGNAL (MESURE) ===
+                        qualite_signal = evaluer_qualite_signal(
                             list(green_buffer), 
                             list(bpm_recent_window)
                         )
                         
-                        # === DÉTERMINER LE STATUT FINAL ===
-                        frame_status, status_color = determiner_status(bpm_final, is_signal_stable)
-                        frame_status_list.append(frame_status)
+                        # === ÉVALUER LE DIAGNOSTIC DE LA PERSONNE (CLINIQUE) ===
+                        diagnostic_personne, couleur_diagnostic = evaluer_diagnostic_personne(
+                            bpm_final, 
+                            qualite_signal
+                        )
                         
-                        # === AFFICHAGE SUR LA FRAME ===
+                        # Enregistrer les deux statuts séparés
+                        frame_signal_quality_list.append(qualite_signal)
+                        frame_diagnostic_list.append(diagnostic_personne)
+                        
+                        # === AFFICHAGE SUR LA FRAME : 2 LIGNES DISTINCTES ===
+                        couleur_signal = obtenir_couleur_signal(qualite_signal)
+                        
                         cv2.putText(frame, f"Fichier: {nom_video} ({index}/{len(liste_videos)})", 
                                    (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                         cv2.putText(frame, f"BPM (CNN): {int(bpm_final)}", 
-                                   (x, y - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-                        cv2.putText(frame, f"BPM (Peak): {int(bpm_classique)}", 
-                                   (x, y - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        cv2.putText(frame, frame_status, 
-                                   (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+                                   (x, y - 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, couleur_signal, 2)
+                        
+                        # Ligne 1 : SIGNAL
+                        cv2.putText(frame, f"SIGNAL: {qualite_signal}", 
+                                   (x, y - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, couleur_signal, 2)
+                        
+                        # Ligne 2 : PERSONNE
+                        cv2.putText(frame, f"PERSONNE: {diagnostic_personne}", 
+                                   (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, couleur_diagnostic, 2)
                     else:
-                        frame_status = "INITIALISATION..."
-                        cv2.putText(frame, frame_status, 
+                        cv2.putText(frame, "Initialisation du signal...", 
                                    (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
             # Dessiner les graphes
             frame_final = dessiner_les_graphes(frame, signal_a_dessiner, 
-                                               list(cnn_bpm_history), bpm_final, frame_status, status_color)
+                                               list(cnn_bpm_history), bpm_final, 
+                                               qualite_signal, diagnostic_personne, couleur_diagnostic)
             
             # Encoder et envoyer la frame
             ret_enc, buffer = cv2.imencode(".jpg", frame_final)
@@ -276,26 +311,38 @@ def generer_flux_batch():
         cap.release()
 
         # === CALCUL DU DIAGNOSTIC FINAL POUR EXCEL ===
-        if frame_status_list:
-            # Compter les frames instables
-            instable_count = sum(1 for status in frame_status_list if status == "INSTABLE")
-            instability_ratio = instable_count / len(frame_status_list)
+        if frame_signal_quality_list and frame_diagnostic_list:
+            # Compter les frames avec signal instable
+            instable_signal_count = sum(1 for q in frame_signal_quality_list if q == "INSTABLE")
+            instability_ratio = instable_signal_count / len(frame_signal_quality_list)
             
-            print(f"    → Frames: {len(frame_status_list)} | Instables: {instable_count} ({instability_ratio*100:.1f}%)")
-            
-            # Déterminer le diagnostic final
+            # Déterminer la qualité GLOBALE du signal
             if instability_ratio >= INSTABILITY_FRAME_THRESHOLD:
-                diagnostic_final = "INSTABLE"
+                qualite_signal_finale = "INSTABLE"
             else:
+                qualite_signal_finale = "STABLE"
+            
+            # Déterminer le diagnostic PERSONNE final
+            # Si le signal est instable globalement → INDÉTERMINÉE
+            if qualite_signal_finale == "INSTABLE":
+                diagnostic_personne_final = "INDETERMINEE"
+            else:
+                # Signal stable → on se fie à la moyenne BPM
                 mean_bpm_cnn = np.mean(bpm_cnn_list) if bpm_cnn_list else 0.0
                 if mean_bpm_cnn < 50:
-                    diagnostic_final = "FATIGUE"
+                    diagnostic_personne_final = "FATIGUE"
                 elif mean_bpm_cnn > 100:
-                    diagnostic_final = "TACHYCARDIE"
+                    diagnostic_personne_final = "TACHYCARDIE"
                 else:
-                    diagnostic_final = "STABLE"
+                    diagnostic_personne_final = "STABLE"
+            
+            print(f"    → Total Frames: {len(frame_signal_quality_list)}")
+            print(f"    → Signal Instables: {instable_signal_count} ({instability_ratio*100:.1f}%)")
+            print(f"    → Qualité Signal Finale: {qualite_signal_finale}")
+            print(f"    → Diagnostic Personne Final: {diagnostic_personne_final}")
         else:
-            diagnostic_final = "ERREUR (pas de données)"
+            qualite_signal_finale = "ERREUR"
+            diagnostic_personne_final = "ERREUR"
             instability_ratio = 0.0
 
         # === ENREGISTREMENT IMMÉDIAT DANS EXCEL ===
@@ -304,14 +351,15 @@ def generer_flux_batch():
             mean_bpm_peak = np.mean(bpm_peak_list) if bpm_peak_list else 0.0
             
             nouvelle_ligne = {
-                "Nom du Fichier": nom_video,
-                "Total Frames": total_frames,
-                "Instability Ratio (%)": round(instability_ratio * 100, 2),
+                "Nom_du_Fichier": nom_video,
+                "Total_Frames": total_frames,
+                "Instability_Ratio_%": round(instability_ratio * 100, 2),
                 "HF_Signal_Moyenne": round(np.mean(high_freq_signals), 5),
                 "HF_Signal_Variance": round(np.std(high_freq_signals), 5),
                 "Moyenne_BPM_CNN": round(mean_bpm_cnn, 2),
                 "Moyenne_BPM_Peak": round(mean_bpm_peak, 2),
-                "Diagnostic": diagnostic_final
+                "Qualite_Signal": qualite_signal_finale,
+                "Diagnostic_Personne": diagnostic_personne_final
             }
 
             # Lire l'existant ou créer un nouveau DataFrame
@@ -329,7 +377,7 @@ def generer_flux_batch():
             # Écriture immédiate sur le disque
             try:
                 df_complet.to_excel(OUTPUT_EXCEL_PATH, index=False)
-                print(f"    [✔] Enregistrement Excel OK : {diagnostic_final}")
+                print(f"    [✔] Enregistrement Excel OK")
             except Exception as e:
                 print(f"    [!] Erreur écriture Excel : {e}")
 
@@ -343,10 +391,12 @@ def video_feed():
 def index():
     return render_template_string('''
     <html>
-        <head><title>NabdVisio Multi-Analytics v2</title></head>
+        <head><title>NabdVisio Multi-Analytics v3 - Séparation Signal/Diagnostic</title></head>
         <body style="text-align: center; background-color: #1a1a1a; color: white; font-family: Arial; padding-top: 20px;">
-            <h2>Interface NabdVisio - Batch Processing View (v2)</h2>
-            <p style="color: #aaa; font-size: 12px;">Logique : Signal stable = STABLE si BPM normal, sinon FATIGUE/TACHYCARDIE</p>
+            <h2>Interface NabdVisio - Batch Processing (v3)</h2>
+            <p style="color: #aaa; font-size: 11px;">
+                <b>Logique séparée :</b> Qualité du SIGNAL (STABLE/INSTABLE) ≠ Diagnostic de la PERSONNE (STABLE/TACHYCARDIE/FATIGUE/INDETERMINEE)
+            </p>
             <img src="/video_feed" style="width: 80%; max-width: 850px; border: 3px solid #444; border-radius:8px; box-shadow: 0px 0px 15px rgba(0,0,0,0.5);"/>
         </body>
     </html>
